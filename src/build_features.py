@@ -14,8 +14,10 @@ PLAYER_SEASON_PATH = (
     PROJECT_ROOT
     / "data"
     / "processed"
-    / "player_season.parquet"
+    / "player_season_big5.parquet"
 )
+
+MATCHES_PATH = PROJECT_ROOT / "data" / "processed" / "matches.parquet"
 
 EVENTS_DIRECTORY = (
     PROJECT_ROOT
@@ -34,7 +36,7 @@ PLAYER_FEATURES_PATH = (
     PROJECT_ROOT
     / "data"
     / "processed"
-    / "player_features.parquet"
+    / "player_features_big5.parquet"
 )
 
 
@@ -186,6 +188,7 @@ def main() -> None:
     player_features = build_player_features(
         player_season=player_season,
         events_directory=EVENTS_DIRECTORY,
+        matches_path=MATCHES_PATH,
     )
 
     validate_role_features(
@@ -220,6 +223,14 @@ def main() -> None:
         f"{len(player_features.columns)}"
     )
     print(f"Output: {PLAYER_FEATURES_PATH}")
+
+    print("\nEligible players per competition:")
+    print(
+        player_features.groupby("competition_id")
+        ["eligible_for_similarity"]
+        .sum()
+        .to_string()
+    )
 
 
 if __name__ == "__main__":

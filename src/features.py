@@ -1,11 +1,11 @@
 """Feature-engineering utilities for player similarity."""
 
-import pandas as pd
 from pathlib import Path
 
 import duckdb
 import pandas as pd
 
+PROFILE_KEYS = ["competition_id", "season_id", "player_id"]
 MINIMUM_MINUTES = 900
 ATTACKING_THIRD_X = 80.0
 PROGRESSIVE_DISTANCE_RATIO = 0.75
@@ -38,8 +38,10 @@ POSITION_TO_ROLE = {
     2: "full_back",
     6: "full_back",
     7: "full_back",
+    8: "full_back",
 
     3: "centre_back",
+    4: "centre_back",
     5: "centre_back",
 
     9: "defensive_midfielder",
@@ -47,6 +49,7 @@ POSITION_TO_ROLE = {
     11: "defensive_midfielder",
 
     13: "central_midfielder",
+    14: "central_midfielder",
     15: "central_midfielder",
 
     12: "wide_player",
@@ -55,12 +58,57 @@ POSITION_TO_ROLE = {
     21: "wide_player",
 
     18: "attacking_midfielder",
+    20: "attacking_midfielder",
     19: "attacking_midfielder",
 
     22: "forward",
     23: "forward",
     24: "forward",
+    25: "forward",
 }
+
+
+def _event_source_sql(
+    events_directory: Path,
+    matches_path: str | Path | None,
+) -> str:
+    """Read events and optionally attach competition and season IDs."""
+
+    events_file = (events_directory / "*.parquet").as_posix()
+    events_file = events_file.replace("'", "''")
+    events_source = (
+        f"read_parquet('{events_file}', union_by_name = TRUE)"
+    )
+
+    if matches_path is None:
+        # Keep the original single-league interface working.
+        return events_source
+
+    matches_path = Path(matches_path)
+    if not matches_path.exists():
+        raise FileNotFoundError(f"Matches file not found: {matches_path}")
+
+    matches_file = matches_path.as_posix().replace("'", "''")
+    return f"""(
+        SELECT
+            events.*,
+            matches.competition_id,
+            matches.season_id
+        FROM {events_source} AS events
+        INNER JOIN read_parquet('{matches_file}') AS matches
+            ON events.match_id = matches.match_id
+    ) AS event_data"""
+
+
+def _profile_sql_parts(matches_path: str | Path | None):
+    """Return profile keys for event aggregation and validations."""
+    if matches_path is None:
+        return "", "player_id", ["player_id"]
+    return (
+        "competition_id, season_id,",
+        "competition_id, season_id, player_id",
+        PROFILE_KEYS,
+    )
 
 
 def calculate_rate(
@@ -120,10 +168,14 @@ def build_base_player_features(
             f"{sorted(missing_columns)}"
         )
 
-    if not player_season["player_id"].is_unique:
-        raise ValueError(
-            "player_id must be unique in player_season."
-        )
+    # A player can appear in several competitions in the same season.
+    keys = (
+        PROFILE_KEYS
+        if set(PROFILE_KEYS).issubset(player_season.columns)
+        else ["player_id"]
+    )
+    if player_season.duplicated(keys).any():
+        raise ValueError(f"Duplicate player-season profiles for {keys}.")
 
     if (
         player_season["minutes_played"] <= 0
@@ -197,6 +249,8 @@ def build_passing_features(
     progressive_distance_ratio: float = (
         PROGRESSIVE_DISTANCE_RATIO
     ),
+    *,
+    matches_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Aggregate event-level passing features by player.
@@ -223,21 +277,17 @@ def build_passing_features(
             "between 0 and 1."
         )
 
-    events_glob = (
-        events_directory
-        / "*.parquet"
-    ).as_posix()
-
-    # Escape apostrophes before inserting the local path
-    # into the DuckDB query.
-    events_glob_sql = events_glob.replace(
-        "'",
-        "''",
+    event_source_sql = _event_source_sql(
+        events_directory, matches_path
+    )
+    keys_select_sql, keys_group_sql, profile_keys = (
+        _profile_sql_parts(matches_path)
     )
 
     query = f"""
         WITH passes AS (
             SELECT
+                {keys_select_sql}
                 CAST(player_id AS BIGINT)
                     AS player_id,
 
@@ -307,10 +357,7 @@ def build_passing_features(
                 )
                     AS is_through_ball
 
-            FROM read_parquet(
-                '{events_glob_sql}',
-                union_by_name = TRUE
-            )
+            FROM {event_source_sql}
 
             WHERE
                 COALESCE(
@@ -367,6 +414,7 @@ def build_passing_features(
         )
 
         SELECT
+            {keys_select_sql}
             player_id,
 
             ANY_VALUE(player_name_events)
@@ -467,9 +515,9 @@ def build_passing_features(
 
         FROM pass_distances
 
-        GROUP BY player_id
+        GROUP BY {keys_group_sql}
 
-        ORDER BY player_id
+        ORDER BY {keys_group_sql}
     """
 
     connection = duckdb.connect()
@@ -483,7 +531,7 @@ def build_passing_features(
     finally:
         connection.close()
 
-    if not passing_features["player_id"].is_unique:
+    if passing_features.duplicated(profile_keys).any():
         raise ValueError(
             "Passing features contain duplicate players."
         )
@@ -512,6 +560,8 @@ def build_carry_features(
     progressive_distance_ratio: float = (
         PROGRESSIVE_DISTANCE_RATIO
     ),
+    *,
+    matches_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Aggregate spatial ball-carrying features by player.
@@ -538,19 +588,17 @@ def build_carry_features(
             "between 0 and 1."
         )
 
-    events_glob = (
-        events_directory
-        / "*.parquet"
-    ).as_posix()
-
-    events_glob_sql = events_glob.replace(
-        "'",
-        "''",
+    event_source_sql = _event_source_sql(
+        events_directory, matches_path
+    )
+    keys_select_sql, keys_group_sql, profile_keys = (
+        _profile_sql_parts(matches_path)
     )
 
     query = f"""
         WITH carries AS (
             SELECT
+                {keys_select_sql}
                 CAST(player_id AS BIGINT)
                     AS player_id,
 
@@ -569,10 +617,7 @@ def build_carry_features(
                 carry_end_location[2]
                     AS end_y
 
-            FROM read_parquet(
-                '{events_glob_sql}',
-                union_by_name = TRUE
-            )
+            FROM {event_source_sql}
 
             WHERE
                 COALESCE(
@@ -630,6 +675,7 @@ def build_carry_features(
         )
 
         SELECT
+            {keys_select_sql}
             player_id,
 
             ANY_VALUE(player_name_events)
@@ -660,9 +706,9 @@ def build_carry_features(
 
         FROM carry_distances
 
-        GROUP BY player_id
+        GROUP BY {keys_group_sql}
 
-        ORDER BY player_id
+        ORDER BY {keys_group_sql}
     """
 
     connection = duckdb.connect()
@@ -676,7 +722,7 @@ def build_carry_features(
     finally:
         connection.close()
 
-    if not carry_features["player_id"].is_unique:
+    if carry_features.duplicated(profile_keys).any():
         raise ValueError(
             "Carry features contain duplicate players."
         )
@@ -702,6 +748,8 @@ def build_carry_features(
 
 def build_shooting_features(
     events_directory: str | Path,
+    *,
+    matches_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """Aggregate non-penalty shooting features by player."""
 
@@ -717,17 +765,17 @@ def build_shooting_features(
             f"{events_directory}."
         )
 
-    events_glob_sql = (
-        events_directory
-        / "*.parquet"
-    ).as_posix().replace(
-        "'",
-        "''",
+    event_source_sql = _event_source_sql(
+        events_directory, matches_path
+    )
+    keys_select_sql, keys_group_sql, profile_keys = (
+        _profile_sql_parts(matches_path)
     )
 
     query = f"""
         WITH shots AS (
             SELECT
+                {keys_select_sql}
                 CAST(player_id AS BIGINT)
                     AS player_id,
 
@@ -748,10 +796,7 @@ def build_shooting_features(
                 )
                     AS shot_xg
 
-            FROM read_parquet(
-                '{events_glob_sql}',
-                union_by_name = TRUE
-            )
+            FROM {event_source_sql}
 
             WHERE
                 COALESCE(
@@ -763,6 +808,7 @@ def build_shooting_features(
         )
 
         SELECT
+            {keys_select_sql}
             player_id,
 
             ANY_VALUE(player_name_events)
@@ -789,9 +835,9 @@ def build_shooting_features(
 
         FROM shots
 
-        GROUP BY player_id
+        GROUP BY {keys_group_sql}
 
-        ORDER BY player_id
+        ORDER BY {keys_group_sql}
     """
 
     connection = duckdb.connect()
@@ -805,7 +851,7 @@ def build_shooting_features(
     finally:
         connection.close()
 
-    if not shooting_features["player_id"].is_unique:
+    if shooting_features.duplicated(profile_keys).any():
         raise ValueError(
             "Shooting features contain duplicate players."
         )
@@ -832,6 +878,8 @@ def build_shooting_features(
 def build_pressure_features(
     events_directory: str | Path,
     attacking_third_x: float = ATTACKING_THIRD_X,
+    *,
+    matches_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """Aggregate spatial pressure features by player."""
 
@@ -853,17 +901,17 @@ def build_pressure_features(
             "0 and 120."
         )
 
-    events_glob_sql = (
-        events_directory
-        / "*.parquet"
-    ).as_posix().replace(
-        "'",
-        "''",
+    event_source_sql = _event_source_sql(
+        events_directory, matches_path
+    )
+    keys_select_sql, keys_group_sql, profile_keys = (
+        _profile_sql_parts(matches_path)
     )
 
     query = f"""
         WITH pressures AS (
             SELECT
+                {keys_select_sql}
                 CAST(player_id AS BIGINT)
                     AS player_id,
 
@@ -873,10 +921,7 @@ def build_pressure_features(
                 location[1]
                     AS pressure_x
 
-            FROM read_parquet(
-                '{events_glob_sql}',
-                union_by_name = TRUE
-            )
+            FROM {event_source_sql}
 
             WHERE
                 COALESCE(
@@ -889,6 +934,7 @@ def build_pressure_features(
         )
 
         SELECT
+            {keys_select_sql}
             player_id,
 
             ANY_VALUE(player_name_events)
@@ -911,9 +957,9 @@ def build_pressure_features(
 
         FROM pressures
 
-        GROUP BY player_id
+        GROUP BY {keys_group_sql}
 
-        ORDER BY player_id
+        ORDER BY {keys_group_sql}
     """
 
     connection = duckdb.connect()
@@ -927,7 +973,7 @@ def build_pressure_features(
     finally:
         connection.close()
 
-    if not pressure_features["player_id"].is_unique:
+    if pressure_features.duplicated(profile_keys).any():
         raise ValueError(
             "Pressure features contain duplicate players."
         )
@@ -960,6 +1006,8 @@ def build_player_features(
     player_season: pd.DataFrame,
     events_directory: str | Path,
     minimum_minutes: int = MINIMUM_MINUTES,
+    *,
+    matches_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Build the complete player feature-engineering table.
@@ -968,25 +1016,41 @@ def build_player_features(
     carrying, shooting and spatial pressure features.
     """
 
+    if matches_path is not None:
+        missing = set(PROFILE_KEYS) - set(player_season.columns)
+        if missing:
+            raise ValueError(f"Missing profile key columns: {sorted(missing)}")
+
+    profile_keys = (
+        PROFILE_KEYS if matches_path is not None else ["player_id"]
+    )
+
+    if player_season.duplicated(profile_keys).any():
+        raise ValueError(f"Duplicate profile keys: {profile_keys}")
+
     player_features = build_base_player_features(
         player_season=player_season,
         minimum_minutes=minimum_minutes,
     )
 
     passing_features = build_passing_features(
-        events_directory
+        events_directory,
+        matches_path=matches_path,
     )
 
     carry_features = build_carry_features(
-        events_directory
+        events_directory,
+        matches_path=matches_path,
     )
 
     shooting_features = build_shooting_features(
-        events_directory
+        events_directory,
+        matches_path=matches_path,
     )
 
     pressure_features = build_pressure_features(
-        events_directory
+        events_directory,
+        matches_path=matches_path,
     )
 
     # Validate event totals against the phase-2 table.
@@ -1080,7 +1144,7 @@ def build_player_features(
     player_features = player_features.merge(
         passing_features[
             [
-                "player_id",
+                *profile_keys,
                 "average_pass_length",
                 "average_completed_pass_length",
                 "average_pass_progression",
@@ -1093,7 +1157,7 @@ def build_player_features(
                 "through_balls",
             ]
         ],
-        on="player_id",
+        on=profile_keys,
         how="left",
         validate="one_to_one",
     )
@@ -1101,13 +1165,13 @@ def build_player_features(
     player_features = player_features.merge(
         carry_features[
             [
-                "player_id",
+                *profile_keys,
                 "average_carry_length",
                 "average_carry_progression",
                 "progressive_carries",
             ]
         ],
-        on="player_id",
+        on=profile_keys,
         how="left",
         validate="one_to_one",
     )
@@ -1115,11 +1179,11 @@ def build_player_features(
     player_features = player_features.merge(
         shooting_features[
             [
-                "player_id",
+                *profile_keys,
                 "non_penalty_shots",
             ]
         ],
-        on="player_id",
+        on=profile_keys,
         how="left",
         validate="one_to_one",
     )
@@ -1127,12 +1191,12 @@ def build_player_features(
     player_features = player_features.merge(
         pressure_features[
             [
-                "player_id",
+                *profile_keys,
                 "average_pressure_height",
                 "high_pressures",
             ]
         ],
-        on="player_id",
+        on=profile_keys,
         how="left",
         validate="one_to_one",
     )
@@ -1142,10 +1206,8 @@ def build_player_features(
             "Feature merges changed the player count."
         )
 
-    if not player_features["player_id"].is_unique:
-        raise ValueError(
-            "Duplicate players detected after merges."
-        )
+    if player_features.duplicated(profile_keys).any():
+        raise ValueError("Duplicate player profiles detected after merges.")
 
     integer_count_columns = [
         "progressive_passes",

@@ -1,6 +1,25 @@
+
+# Data Collection
+statsbombpy
+
+# Data Processing & Engineering
 pandas
+numpy
 pyarrow
 duckdb
-statsbombpy
+
+# Machine Learning
+scikit-learn
+
+# Data Visualization
+matplotlib
+seaborn
+plotly
+mplsoccer
+
+# Web Application
+streamlit
+
+# Development & Testing
 ipykernel
 pytest
