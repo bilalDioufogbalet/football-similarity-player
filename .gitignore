@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local configuration and operating-system files
+.env
+.DS_Store
+
+# Large source and match-level generated datasets
+data/raw/
+data/interim/player_minutes/
+data/processed/events/
+
+# Generated duplicate; the tracked source is config/role_feature_sets.json
+data/processed/role_feature_sets.json
